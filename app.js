@@ -305,10 +305,13 @@ async function convertSinglePdf(item) {
         }
       }
 
-      // 2. Extraer imágenes/logos de la página (ej. Escudo UNAM, firmas, membretes)
+      // 2. Extraer imágenes/logos de la página (ej. Escudo UNAM, firmas, membretes) con timeout de seguridad
       let pageImages = [];
       try {
-        pageImages = await extractPageImages(page);
+        pageImages = await Promise.race([
+          extractPageImages(page),
+          new Promise(r => setTimeout(() => r([]), 2000))
+        ]);
       } catch (imgErr) {
         console.warn(`No se pudieron extraer imágenes de la pág ${p}:`, imgErr);
       }
@@ -317,7 +320,7 @@ async function convertSinglePdf(item) {
       const validChars = (textContent.items || []).map(i => i.str.trim()).join('');
       if (validChars.length < 20 && DOM.optEnableOcr && DOM.optEnableOcr.checked && typeof Tesseract !== 'undefined') {
         item.isScanned = true;
-        item.statusText = `Auto-OCR (pág ${p} de ${numPages})...`;
+        item.statusText = `Digitalizando OCR (pág ${p}/${numPages})...`;
         updateFileCard(item);
 
         const ocrResult = await performOcrOnPdfPage(page, p, item, numPages);
@@ -370,66 +373,102 @@ async function extractPageImages(pdfPage) {
 
   try {
     const opList = await pdfPage.getOperatorList();
-    const processed = new Set();
-
+    const imgNames = [];
     for (let i = 0; i < opList.fnArray.length; i++) {
       if (opList.fnArray[i] === pdfjsLib.OPS.paintImageXObject) {
-        const imgName = opList.argsArray[i][0];
-        if (processed.has(imgName)) continue;
-        processed.add(imgName);
+        imgNames.push(opList.argsArray[i][0]);
+      }
+    }
 
-        try {
-          const imgObj = await new Promise(resolve => {
-            pdfPage.objs.get(imgName, obj => resolve(obj));
-          });
+    if (imgNames.length === 0) return images;
 
-          if (imgObj && imgObj.width >= 24 && imgObj.height >= 24 && imgObj.data) {
-            const canvas = document.createElement('canvas');
-            canvas.width = imgObj.width;
-            canvas.height = imgObj.height;
-            const ctx = canvas.getContext('2d');
-            const imgData = ctx.createImageData(imgObj.width, imgObj.height);
+    // Pase rápido offscreen para decodificar XObjects si aún no están en page.objs
+    if (typeof document !== 'undefined') {
+      try {
+        const dummyCanvas = document.createElement('canvas');
+        dummyCanvas.width = 120;
+        dummyCanvas.height = 120;
+        const dummyCtx = dummyCanvas.getContext('2d');
+        const viewport = pdfPage.getViewport({ scale: 0.2 });
+        await Promise.race([
+          pdfPage.render({ canvasContext: dummyCtx, viewport }).promise,
+          new Promise(r => setTimeout(r, 600))
+        ]);
+      } catch (e) {
+        // Fallback silencioso
+      }
+    }
 
-            if (imgObj.data.length === imgObj.width * imgObj.height * 4) {
-              imgData.data.set(imgObj.data);
-            } else if (imgObj.data.length === imgObj.width * imgObj.height * 3) {
-              for (let s = 0, d = 0; s < imgObj.data.length; s += 3, d += 4) {
-                imgData.data[d] = imgObj.data[s];
-                imgData.data[d + 1] = imgObj.data[s + 1];
-                imgData.data[d + 2] = imgObj.data[s + 2];
-                imgData.data[d + 3] = 255;
-              }
-            } else if (imgObj.data.length === imgObj.width * imgObj.height) {
-              // Escala de grises (como el escudo universitario en B/N)
-              for (let s = 0, d = 0; s < imgObj.data.length; s++, d += 4) {
-                const val = imgObj.data[s];
-                imgData.data[d] = val;
-                imgData.data[d + 1] = val;
-                imgData.data[d + 2] = val;
-                imgData.data[d + 3] = 255;
-              }
-            } else {
-              continue;
-            }
+    const processed = new Set();
+    for (const imgName of imgNames) {
+      if (processed.has(imgName)) continue;
+      processed.add(imgName);
 
-            ctx.putImageData(imgData, 0, 0);
-            const blob = await new Promise(r => canvas.toBlob(r, 'image/png'));
-            if (blob) {
-              const arrayBuf = await blob.arrayBuffer();
-              const maxDisplayWidth = 140;
-              const displayWidth = Math.min(maxDisplayWidth, imgObj.width);
-              const displayHeight = Math.round(displayWidth * (imgObj.height / imgObj.width));
-
-              images.push({
-                data: arrayBuf,
-                width: displayWidth,
-                height: displayHeight
+      try {
+        // Timeout de seguridad estricto de 350ms: NUNCA trabará la conversión
+        const imgObj = await new Promise(resolve => {
+          const timer = setTimeout(() => resolve(null), 350);
+          try {
+            if (pdfPage.objs && typeof pdfPage.objs.get === 'function') {
+              pdfPage.objs.get(imgName, obj => {
+                clearTimeout(timer);
+                resolve(obj);
               });
+            } else {
+              clearTimeout(timer);
+              resolve(null);
             }
+          } catch (e) {
+            clearTimeout(timer);
+            resolve(null);
           }
-        } catch (imgLoadErr) {
-          console.warn('Error procesando imagen individual:', imgLoadErr);
+        });
+
+        if (imgObj && imgObj.width >= 24 && imgObj.height >= 24 && imgObj.data) {
+          const canvas = document.createElement('canvas');
+          canvas.width = imgObj.width;
+          canvas.height = imgObj.height;
+          const ctx = canvas.getContext('2d');
+          const imgData = ctx.createImageData(imgObj.width, imgObj.height);
+
+          if (imgObj.data.length === imgObj.width * imgObj.height * 4) {
+            imgData.data.set(imgObj.data);
+          } else if (imgObj.data.length === imgObj.width * imgObj.height * 3) {
+            for (let s = 0, d = 0; s < imgObj.data.length; s += 3, d += 4) {
+              imgData.data[d] = imgObj.data[s];
+              imgData.data[d + 1] = imgObj.data[s + 1];
+              imgData.data[d + 2] = imgObj.data[s + 2];
+              imgData.data[d + 3] = 255;
+            }
+          } else if (imgObj.data.length === imgObj.width * imgObj.height) {
+            for (let s = 0, d = 0; s < imgObj.data.length; s++, d += 4) {
+              const val = imgObj.data[s];
+              imgData.data[d] = val;
+              imgData.data[d + 1] = val;
+              imgData.data[d + 2] = val;
+              imgData.data[d + 3] = 255;
+            }
+          } else {
+            continue;
+          }
+
+          ctx.putImageData(imgData, 0, 0);
+          const blob = await new Promise(r => canvas.toBlob(r, 'image/png'));
+          if (blob) {
+            const arrayBuf = await blob.arrayBuffer();
+            const maxDisplayWidth = 140;
+            const displayWidth = Math.min(maxDisplayWidth, imgObj.width);
+            const displayHeight = Math.round(displayWidth * (imgObj.height / imgObj.width));
+
+            images.push({
+              data: arrayBuf,
+              width: displayWidth,
+              height: displayHeight
+            });
+          }
         }
+      } catch (imgLoadErr) {
+        console.warn('Error procesando imagen individual:', imgLoadErr);
       }
     }
   } catch (err) {
@@ -460,6 +499,15 @@ async function performOcrOnPdfPage(pdfPage, pageNumber, item, numPages) {
         if (m.status === 'recognizing text' && typeof m.progress === 'number') {
           const pct = Math.round(m.progress * 100);
           item.statusText = `OCR (pág ${pageNumber}/${numPages}): ${pct}%`;
+          item.progress = Math.min(85, Math.round((pageNumber / numPages) * 70) + Math.round(pct * 0.15));
+          updateFileCard(item);
+        } else if (m.status) {
+          if (m.status.includes('loading') || m.status.includes('downloading')) {
+            const pct = typeof m.progress === 'number' ? ` ${Math.round(m.progress * 100)}%` : '';
+            item.statusText = `Descargando motor OCR${pct}...`;
+          } else {
+            item.statusText = `Iniciando OCR (pág ${pageNumber}/${numPages})...`;
+          }
           updateFileCard(item);
         }
       }
@@ -1147,8 +1195,8 @@ function renderFileCard(item) {
       <button type="button" class="btn btn-outline btn-sm btn-view" id="btn_view_${item.id}" title="Ver original y editar texto">
         <i class="fa-solid fa-eye"></i> Ver / Editar
       </button>
-      <button type="button" class="btn btn-primary btn-sm btn-download" id="btn_down_${item.id}" disabled title="Descargar archivo Word editable">
-        <i class="fa-solid fa-file-word"></i> Descargar Word
+      <button type="button" class="btn btn-primary btn-sm btn-download" id="btn_down_${item.id}" title="Convertir a Word">
+        <i class="fa-solid fa-bolt"></i> Convertir
       </button>
       <button type="button" class="btn btn-danger-soft btn-sm btn-icon-only btn-remove" id="btn_rem_${item.id}" title="Eliminar de la lista">
         <i class="fa-solid fa-trash"></i>
@@ -1158,7 +1206,13 @@ function renderFileCard(item) {
 
   // Asignar eventos de la tarjeta
   card.querySelector(`#btn_view_${item.id}`).addEventListener('click', () => openPreviewModal(item.id));
-  card.querySelector(`#btn_down_${item.id}`).addEventListener('click', () => downloadSingleDocx(item));
+  card.querySelector(`#btn_down_${item.id}`).addEventListener('click', () => {
+    if (item.status === 'completed' && item.docxBlob) {
+      downloadSingleDocx(item);
+    } else if (item.status === 'pending' || item.status === 'error') {
+      convertSinglePdf(item);
+    }
+  });
   card.querySelector(`#btn_rem_${item.id}`).addEventListener('click', () => removeFileFromQueue(item.id));
 
   DOM.fileGrid.appendChild(card);
@@ -1201,10 +1255,26 @@ function updateFileCard(item) {
 
   const downBtn = document.getElementById(`btn_down_${item.id}`);
   if (downBtn) {
-    downBtn.disabled = item.status !== 'completed' || !item.docxBlob;
     if (item.status === 'completed') {
-      downBtn.classList.remove('btn-primary');
-      downBtn.classList.add('btn-success');
+      downBtn.disabled = false;
+      downBtn.className = 'btn btn-success btn-sm btn-download';
+      downBtn.innerHTML = '<i class="fa-solid fa-file-word"></i> Descargar Word';
+      downBtn.title = 'Descargar archivo Word editable';
+    } else if (item.status === 'processing') {
+      downBtn.disabled = true;
+      downBtn.className = 'btn btn-primary btn-sm btn-download';
+      downBtn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Convirtiendo...';
+      downBtn.title = 'Conversión en progreso';
+    } else if (item.status === 'error') {
+      downBtn.disabled = false;
+      downBtn.className = 'btn btn-danger btn-sm btn-download';
+      downBtn.innerHTML = '<i class="fa-solid fa-rotate-right"></i> Reintentar';
+      downBtn.title = 'Hubo un error. Haz clic para reintentar';
+    } else {
+      downBtn.disabled = false;
+      downBtn.className = 'btn btn-primary btn-sm btn-download';
+      downBtn.innerHTML = '<i class="fa-solid fa-bolt"></i> Convertir';
+      downBtn.title = 'Convertir este archivo a Word';
     }
   }
 
