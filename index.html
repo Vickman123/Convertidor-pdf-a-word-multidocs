@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Convertidor de PDF a Word (.docx) Editable | Conversión Masiva</title>
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  <!-- FontAwesome Icons -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+  <!-- CSS Principal -->
+  <link rel="stylesheet" href="style.css">
+
+  <!-- Librerías Clave (CDNs) -->
+  <!-- 1. PDF.js de Mozilla y su worker pre-cargado -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js"></script>
+  <!-- 2. docx.js para generación de archivos Word .docx nativos -->
+  <script src="https://cdn.jsdelivr.net/npm/docx@8.5.0/build/index.umd.js"></script>
+  <!-- 3. JSZip para empaquetado y descarga masiva en .ZIP -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <!-- 4. FileSaver para descargas seguras -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/FileSaver.js/2.0.5/FileSaver.min.js"></script>
+</head>
+<body>
+
+  <!-- Encabezado Principal -->
+  <header class="app-header">
+    <div class="header-container">
+      <div class="brand">
+        <div class="brand-icon">
+          <i class="fa-solid fa-file-word"></i>
+        </div>
+        <div>
+          <h1>PDF a Word <span class="badge-pro">EDITABLE</span></h1>
+          <p class="subtitle">Convierte documentos individuales o en masa (10+ archivos) a formato .docx real</p>
+        </div>
+      </div>
+
+      <div class="header-badges">
+        <div class="pill-badge">
+          <i class="fa-solid fa-shield-halved text-success"></i> 100% Privado y Seguro
+        </div>
+        <div class="pill-badge">
+          <i class="fa-solid fa-layer-group text-primary"></i> Conversión en Masa
+        </div>
+        <div class="pill-badge">
+          <i class="fa-solid fa-bolt text-warning"></i> En tu Navegador
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <!-- Contenedor Principal -->
+  <main class="main-container">
+
+    <!-- Zona de Carga (Drag & Drop) -->
+    <section class="upload-section">
+      <div class="dropzone" id="dropzone">
+        <input type="file" id="fileInput" accept="application/pdf" multiple class="file-input-hidden">
+        <div class="dropzone-content">
+          <div class="drop-icon-wrapper">
+            <i class="fa-solid fa-cloud-arrow-up drop-icon"></i>
+          </div>
+          <h2>Arrastra y suelta tus archivos PDF aquí</h2>
+          <p class="drop-subtext">o si lo prefieres, pulsa el botón para buscar en tu equipo</p>
+          <button type="button" class="btn btn-primary btn-lg" id="browseBtn">
+            <i class="fa-solid fa-folder-open"></i> Seleccionar Archivos PDF
+          </button>
+          <div class="drop-hint">
+            <i class="fa-solid fa-circle-check text-success"></i>
+            <span>Puedes seleccionar <strong>10, 20 o más archivos a la vez</strong> para procesarlos en lote.</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Barra de Control Masivo y Estadísticas (Oculta si no hay archivos) -->
+    <section class="batch-controls-section" id="batchControlsSection" style="display: none;">
+      <div class="batch-header">
+        <div class="stats-group">
+          <div class="stat-pill">
+            <span class="stat-label">Total Archivos:</span>
+            <span class="stat-value" id="statTotal">0</span>
+          </div>
+          <div class="stat-pill">
+            <span class="stat-label">Listos / Espera:</span>
+            <span class="stat-value text-muted" id="statPending">0</span>
+          </div>
+          <div class="stat-pill">
+            <span class="stat-label">Convertidos:</span>
+            <span class="stat-value text-success" id="statCompleted">0</span>
+          </div>
+        </div>
+
+        <div class="batch-actions">
+          <button type="button" class="btn btn-outline" id="addMoreBtn">
+            <i class="fa-solid fa-plus"></i> Añadir Más
+          </button>
+          <button type="button" class="btn btn-primary" id="convertAllBtn">
+            <i class="fa-solid fa-bolt"></i> Convertir Todos
+          </button>
+          <button type="button" class="btn btn-success" id="downloadZipBtn" disabled>
+            <i class="fa-solid fa-file-zipper"></i> Descargar Todos (.ZIP)
+          </button>
+          <button type="button" class="btn btn-danger-soft" id="clearAllBtn" title="Limpiar lista completa">
+            <i class="fa-solid fa-trash-can"></i> Limpiar
+          </button>
+        </div>
+      </div>
+
+      <!-- Barra de Progreso Global -->
+      <div class="global-progress-container" id="globalProgressContainer" style="display: none;">
+        <div class="progress-info">
+          <span class="progress-title" id="globalProgressText">Procesando lote de archivos...</span>
+          <span class="progress-pct" id="globalProgressPct">0%</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-bar" id="globalProgressBar" style="width: 0%;"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Lista de Archivos en Cola -->
+    <section class="file-queue-section" id="fileQueueSection" style="display: none;">
+      <div class="queue-header">
+        <h3><i class="fa-solid fa-list-check"></i> Cola de Documentos (<span id="queueCount">0</span>)</h3>
+        <span class="queue-subtitle">Puedes convertir individualmente o visualizar y editar cada documento antes de descargarlo</span>
+      </div>
+
+      <div class="file-grid" id="fileGrid">
+        <!-- Tarjetas dinámicas inyectadas por app.js -->
+      </div>
+    </section>
+
+    <!-- Características y Beneficios -->
+    <section class="features-section">
+      <div class="feature-card">
+        <div class="feature-icon bg-blue">
+          <i class="fa-solid fa-file-pen"></i>
+        </div>
+        <h3>Word 100% Editable</h3>
+        <p>No pega imágenes estáticas. Extrae y formatea el texto en párrafos reales con detección de títulos y encabezados compatibles con Microsoft Word.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon bg-indigo">
+          <i class="fa-solid fa-boxes-stacked"></i>
+        </div>
+        <h3>Conversión Masiva por Lotes</h3>
+        <p>Sube 10 o más PDFs de una sola vez. Conviértelos con un solo clic y descárgalos todos juntos en un cómodo archivo comprimido <strong>.ZIP</strong>.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon bg-emerald">
+          <i class="fa-solid fa-lock"></i>
+        </div>
+        <h3>100% Seguro y Privado</h3>
+        <p>Tus documentos <strong>nunca salen de tu computadora</strong>. Todo el procesamiento ocurre en la memoria local de tu navegador sin riesgo de filtraciones.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon bg-purple">
+          <i class="fa-solid fa-eye"></i>
+        </div>
+        <h3>Visor y Editor Integrado</h3>
+        <p>Compara el PDF original página por página con el texto extraído y realiza modificaciones o adiciones directamente antes de exportar a Word.</p>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Modal / Visor y Editor de Documento -->
+  <div class="modal-backdrop" id="previewModal" style="display: none;">
+    <div class="modal-dialog">
+      <div class="modal-header">
+        <div class="modal-title-box">
+          <i class="fa-solid fa-file-waveform text-primary"></i>
+          <div>
+            <h3 id="modalFileName">Nombre del archivo.pdf</h3>
+            <span class="modal-subtitle" id="modalFileDetails">Página 1 de 1</span>
+          </div>
+        </div>
+        <div class="modal-header-actions">
+          <button type="button" class="btn btn-success btn-sm" id="modalDownloadDocxBtn">
+            <i class="fa-solid fa-download"></i> Descargar Word (.docx)
+          </button>
+          <button type="button" class="btn-close" id="modalCloseBtn" title="Cerrar ventana">
+            <i class="fa-solid fa-xmark"></i>
+          </button>
+        </div>
+      </div>
+
+      <div class="modal-body split-view">
+        <!-- Panel Izquierdo: Previsualización Original en Canvas -->
+        <div class="split-pane pane-pdf">
+          <div class="pane-toolbar">
+            <span class="pane-title"><i class="fa-solid fa-file-pdf text-danger"></i> PDF Original</span>
+            <div class="page-nav">
+              <button type="button" class="btn-nav" id="prevPageBtn" title="Página anterior"><i class="fa-solid fa-chevron-left"></i></button>
+              <span id="pageIndicator">1 / 1</span>
+              <button type="button" class="btn-nav" id="nextPageBtn" title="Página siguiente"><i class="fa-solid fa-chevron-right"></i></button>
+            </div>
+            <div class="zoom-nav">
+              <button type="button" class="btn-nav" id="zoomOutBtn" title="Reducir zoom"><i class="fa-solid fa-magnifying-glass-minus"></i></button>
+              <span id="zoomLevel">100%</span>
+              <button type="button" class="btn-nav" id="zoomInBtn" title="Aumentar zoom"><i class="fa-solid fa-magnifying-glass-plus"></i></button>
+            </div>
+          </div>
+          <div class="canvas-viewport" id="canvasViewport">
+            <canvas id="pdfCanvas"></canvas>
+            <div class="canvas-loading" id="canvasLoading" style="display: none;">
+              <i class="fa-solid fa-spinner fa-spin"></i> Cargando página...
+            </div>
+          </div>
+        </div>
+
+        <!-- Panel Derecho: Editor de Texto Extraído -->
+        <div class="split-pane pane-editor">
+          <div class="pane-toolbar">
+            <span class="pane-title"><i class="fa-solid fa-pen-to-square text-primary"></i> Contenido Editable para Word</span>
+            <div class="editor-quick-actions">
+              <button type="button" class="btn btn-outline btn-xs" id="copyTextBtn" title="Copiar todo el texto">
+                <i class="fa-solid fa-copy"></i> Copiar
+              </button>
+              <button type="button" class="btn btn-outline btn-xs" id="refreshExtractedBtn" title="Restaurar texto original">
+                <i class="fa-solid fa-rotate-left"></i> Revertir
+              </button>
+            </div>
+          </div>
+          <div class="editor-container">
+            <div class="editor-tip">
+              <i class="fa-solid fa-circle-info"></i> Puedes escribir o modificar este texto directamente. Lo que ves aquí será lo que se guardará en tu archivo <strong>.docx</strong> editable.
+            </div>
+            <textarea id="extractedTextEditor" placeholder="Extrayendo texto del PDF..."></textarea>
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <span class="footer-hint"><i class="fa-solid fa-keyboard"></i> Los saltos de línea dobles generarán nuevos párrafos en Word.</span>
+        <div class="footer-buttons">
+          <button type="button" class="btn btn-secondary" id="modalCloseBtn2">Cerrar</button>
+          <button type="button" class="btn btn-primary" id="modalSaveAndDownloadBtn">
+            <i class="fa-solid fa-file-word"></i> Guardar y Descargar Word (.docx)
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Notificaciones Flotantes (Toasts) -->
+  <div class="toast-container" id="toastContainer"></div>
+
+  <!-- Pie de Página -->
+  <footer class="app-footer">
+    <p>Convertidor de PDF a Word (.docx) Editable &bull; Procesamiento Masivo &bull; 100% en el Navegador</p>
+  </footer>
+
+  <!-- Script Principal de la Aplicación -->
+  <script src="app.js"></script>
+</body>
+</html>

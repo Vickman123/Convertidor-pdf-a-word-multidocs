@@ -1,0 +1,12 @@
+# Logs y temporales
+*.log
+*.zip
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+
+# Node
+node_modules/
