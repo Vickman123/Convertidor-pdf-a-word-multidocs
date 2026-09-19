@@ -15,10 +15,13 @@ Una potente aplicación web construida con **HTML5, CSS3 y JavaScript moderno** 
   - Barra de progreso global y control individual por documento.
   - Botón maestro **"Convertir Todos"**.
   - Botón maestro **"Descargar Todos (.ZIP)"** para obtener todos los archivos Word empaquetados en un solo clic.
-- **📐 Motor de Maquetación Organizacional (Fidelidad Espacial)**:
+- **📐 Motor de Maquetación Organizacional e Institucional**:
+  - **Reflujo de Texto Continuo y Justificado**: Agrupa automáticamente las líneas pertenecientes al mismo párrafo institucional, preservando la justificación completa (`AlignmentType.BOTH`) sin saltos de línea huérfanos.
+  - **Formato Mixto en el Mismo Renglón**: Detecta y conserva negritas y cursivas intercaladas dentro de un mismo párrafo (ej. nombres de dependencias o funcionarios en negrita dentro de texto regular) usando `docx.TextRun`.
+  - **Listas y Viñetas Nativas con Sangría Francesa**: Identifica viñetas institucionales (bullets •, números, letras) y las formatea con sangría colgante profesional (`indent: { left: 720, hanging: 360 }`).
+  - **Preservación de Logotipos y Membretes**: Extrae automáticamente imágenes vectoriales y de mapa de bits (escudos universitarios, logotipos gubernamentales) y los inserta como encabezados gráficos en Word.
   - **Detección Automática de Tablas**: Identifica bloques con columnas y los convierte en tablas nativas de Word (`docx.Table`), evitando que el texto se descuadre.
-  - **Alineación y Sangrías**: Conserva textos centrados, firmas a la derecha e indentaciones de párrafos según sus coordenadas exactas en la hoja.
-  - **Jerarquía Tipográfica**: Reconoce encabezados (H1, H2) según el tamaño de fuente y estilo original.
+  - **Jerarquía Tipográfica**: Reconoce títulos principales (H1, H2) según tamaño y estilo original.
 - **🔍 Auto-OCR Inteligente (Tesseract.js)**:
   - Detección automática de páginas escaneadas o fotocopias sin capa de texto seleccionable.
   - Reconocimiento óptico de caracteres en segundo plano en múltiples idiomas (Español / Inglés).

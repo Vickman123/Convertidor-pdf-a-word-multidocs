@@ -282,9 +282,38 @@ async function convertSinglePdf(item) {
 
       const page = await item.pdfDoc.getPage(p);
       const viewport = page.getViewport({ scale: 1.0 });
+      
+      // Asegurar carga de operadores para extraer fuentes exactas e imágenes
+      try { await page.getOperatorList(); } catch (e) {}
+      
       let textContent = await page.getTextContent();
 
-      // Chequear si la página carece de capa de texto (documento escaneado / imagen)
+      // 1. Mapear fuentes desde page.commonObjs para detectar negritas reales en el PDF
+      const fontStylesMap = {};
+      if (page.commonObjs) {
+        for (const fontId of Object.keys(textContent.styles || {})) {
+          if (page.commonObjs.has(fontId)) {
+            const fo = page.commonObjs.get(fontId);
+            if (fo) {
+              fontStylesMap[fontId] = {
+                name: fo.name || '',
+                bold: !!fo.bold || /bold|black|heavy|demi/i.test(fo.name || ''),
+                italic: !!fo.italic || /italic|oblique/i.test(fo.name || '')
+              };
+            }
+          }
+        }
+      }
+
+      // 2. Extraer imágenes/logos de la página (ej. Escudo UNAM, firmas, membretes)
+      let pageImages = [];
+      try {
+        pageImages = await extractPageImages(page);
+      } catch (imgErr) {
+        console.warn(`No se pudieron extraer imágenes de la pág ${p}:`, imgErr);
+      }
+
+      // 3. Chequear si es escaneo sin capa de texto y aplicar OCR si está activo
       const validChars = (textContent.items || []).map(i => i.str.trim()).join('');
       if (validChars.length < 20 && DOM.optEnableOcr && DOM.optEnableOcr.checked && typeof Tesseract !== 'undefined') {
         item.isScanned = true;
@@ -297,7 +326,10 @@ async function convertSinglePdf(item) {
         }
       }
 
-      const pageData = processPageTextContent(textContent, p, viewport.width, viewport.height);
+      // 4. Analizar la página con fidelidad espacial, párrafos continuos y viñetas
+      const pageData = processPageTextContent(textContent, p, viewport.width, viewport.height, fontStylesMap);
+      pageData.images = pageImages;
+
       const tablesInPage = pageData.blocks.filter(b => b.type === 'table').length;
       tablesDetectedCount += tablesInPage;
 
@@ -306,7 +338,7 @@ async function convertSinglePdf(item) {
 
     item.tablesCount = tablesDetectedCount;
 
-    // 3. Generar el documento Microsoft Word (.docx) con maquetación avanzada
+    // 5. Generar el documento Microsoft Word (.docx) con maquetación avanzada
     item.statusText = 'Generando Word (.docx)...';
     item.progress = 90;
     updateFileCard(item);
@@ -327,6 +359,83 @@ async function convertSinglePdf(item) {
     updateFileCard(item);
     updateStats();
   }
+}
+
+/**
+ * Extrae imágenes incrustadas en la página PDF (escudos, logotipos, firmas)
+ */
+async function extractPageImages(pdfPage) {
+  const images = [];
+  if (typeof pdfjsLib === 'undefined' || !pdfPage.getOperatorList) return images;
+
+  try {
+    const opList = await pdfPage.getOperatorList();
+    const processed = new Set();
+
+    for (let i = 0; i < opList.fnArray.length; i++) {
+      if (opList.fnArray[i] === pdfjsLib.OPS.paintImageXObject) {
+        const imgName = opList.argsArray[i][0];
+        if (processed.has(imgName)) continue;
+        processed.add(imgName);
+
+        try {
+          const imgObj = await new Promise(resolve => {
+            pdfPage.objs.get(imgName, obj => resolve(obj));
+          });
+
+          if (imgObj && imgObj.width >= 24 && imgObj.height >= 24 && imgObj.data) {
+            const canvas = document.createElement('canvas');
+            canvas.width = imgObj.width;
+            canvas.height = imgObj.height;
+            const ctx = canvas.getContext('2d');
+            const imgData = ctx.createImageData(imgObj.width, imgObj.height);
+
+            if (imgObj.data.length === imgObj.width * imgObj.height * 4) {
+              imgData.data.set(imgObj.data);
+            } else if (imgObj.data.length === imgObj.width * imgObj.height * 3) {
+              for (let s = 0, d = 0; s < imgObj.data.length; s += 3, d += 4) {
+                imgData.data[d] = imgObj.data[s];
+                imgData.data[d + 1] = imgObj.data[s + 1];
+                imgData.data[d + 2] = imgObj.data[s + 2];
+                imgData.data[d + 3] = 255;
+              }
+            } else if (imgObj.data.length === imgObj.width * imgObj.height) {
+              // Escala de grises (como el escudo universitario en B/N)
+              for (let s = 0, d = 0; s < imgObj.data.length; s++, d += 4) {
+                const val = imgObj.data[s];
+                imgData.data[d] = val;
+                imgData.data[d + 1] = val;
+                imgData.data[d + 2] = val;
+                imgData.data[d + 3] = 255;
+              }
+            } else {
+              continue;
+            }
+
+            ctx.putImageData(imgData, 0, 0);
+            const blob = await new Promise(r => canvas.toBlob(r, 'image/png'));
+            if (blob) {
+              const arrayBuf = await blob.arrayBuffer();
+              const maxDisplayWidth = 140;
+              const displayWidth = Math.min(maxDisplayWidth, imgObj.width);
+              const displayHeight = Math.round(displayWidth * (imgObj.height / imgObj.width));
+
+              images.push({
+                data: arrayBuf,
+                width: displayWidth,
+                height: displayHeight
+              });
+            }
+          }
+        } catch (imgLoadErr) {
+          console.warn('Error procesando imagen individual:', imgLoadErr);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('Error en extractPageImages:', err);
+  }
+  return images;
 }
 
 /**
@@ -361,7 +470,7 @@ async function performOcrOnPdfPage(pdfPage, pageNumber, item, numPages) {
       for (const line of result.data.lines) {
         if (!line.text || line.text.trim().length === 0) continue;
         const x = line.bbox.x0 / scale;
-        const y = (viewport.height - line.bbox.y1) / scale; // Convertir origen a inferior izquierdo PDF
+        const y = (viewport.height - line.bbox.y1) / scale;
         const width = (line.bbox.x1 - line.bbox.x0) / scale;
         const height = (line.bbox.y1 - line.bbox.y0) / scale;
         const fontSize = Math.max(10, Math.round(height * 0.85));
@@ -386,39 +495,36 @@ async function performOcrOnPdfPage(pdfPage, pageNumber, item, numPages) {
 
 /**
  * Analiza los items de texto devueltos por PDF.js o Tesseract OCR:
- * Agrupa por coordenadas Y (líneas), detecta columnas horizontales separadas (X),
- * agrupa líneas paralelas en Tablas y detecta alineaciones (centrado, derecha, sangrías).
+ * 1. Mantiene cada fragmento tipográfico (negrita, cursiva, tamaño) sin aplanarlo.
+ * 2. Une líneas en párrafos continuos justificados.
+ * 3. Identifica viñetas y aplica sangría colgante estándar.
+ * 4. Agrupa tablas multi-columna.
  */
-function processPageTextContent(textContent, pageNumber, pageWidth = 612, pageHeight = 792) {
+function processPageTextContent(textContent, pageNumber, pageWidth = 612, pageHeight = 792, fontStylesMap = {}) {
   const items = textContent.items;
   if (!items || items.length === 0) {
-    return {
-      pageNumber,
-      pageWidth,
-      pageHeight,
-      blocks: [],
-      lines: [],
-      rawText: ''
-    };
+    return { pageNumber, pageWidth, pageHeight, blocks: [], lines: [], rawText: '' };
   }
 
-  // Filtrar elementos vacíos
   const validItems = items.filter(it => it.str && it.str.trim().length > 0);
   if (validItems.length === 0) {
     return { pageNumber, pageWidth, pageHeight, blocks: [], lines: [], rawText: '' };
   }
 
-  // Agrupar items en la misma línea usando la coordenada Y (transform[5])
+  // Agrupar items en la misma línea usando la coordenada Y
   const linesMap = [];
-  const Y_TOLERANCE = 4.5; // Puntos de tolerancia para la misma línea base
+  const Y_TOLERANCE = 4.5;
 
   for (const it of validItems) {
     const x = it.transform[4];
     const y = it.transform[5];
     const fontSize = Math.abs(it.transform[0]) || Math.abs(it.transform[3]) || it.height || 11;
-    const fontName = (it.fontName || '').toLowerCase();
-    const isBold = fontName.includes('bold') || fontName.includes('black') || fontName.includes('heavy');
-    const isItalic = fontName.includes('italic') || fontName.includes('oblique');
+    
+    // Consulta exacta de fuentes pre-mapeadas desde page.commonObjs
+    const fontInfo = fontStylesMap[it.fontName] || {};
+    const fontNameLower = (fontInfo.name || it.fontName || '').toLowerCase();
+    const isBold = fontInfo.bold !== undefined ? fontInfo.bold : /bold|black|heavy|demi/i.test(fontNameLower);
+    const isItalic = fontInfo.italic !== undefined ? fontInfo.italic : /italic|oblique/i.test(fontNameLower);
     const itemWidth = it.width || (it.str.length * fontSize * 0.52);
 
     let foundLine = linesMap.find(line => Math.abs(line.y - y) <= Y_TOLERANCE);
@@ -440,26 +546,40 @@ function processPageTextContent(textContent, pageNumber, pageWidth = 612, pageHe
     });
   }
 
-  // Ordenar las líneas de arriba hacia abajo (Y descendente en PDF)
+  // Ordenar de arriba hacia abajo (Y descendente)
   linesMap.sort((a, b) => b.y - a.y);
 
-  // Calcular tamaño de fuente promedio de la página
+  // Calcular tamaño promedio de fuente
   const allFontSizes = validItems.map(it => Math.abs(it.transform[0]) || 11);
   const avgFontSize = allFontSizes.reduce((a, b) => a + b, 0) / (allFontSizes.length || 1);
 
-  // Umbral horizontal para separar columnas en una misma línea
   const COLUMN_GAP_THRESHOLD = 32.0;
   const processedLines = [];
 
   for (const line of linesMap) {
-    // Ordenar de izquierda a derecha
     line.items.sort((a, b) => a.x - b.x);
 
+    const runs = [];
     const cells = [];
     let currentCell = null;
 
     for (let i = 0; i < line.items.length; i++) {
       const it = line.items[i];
+      const prev = i > 0 ? line.items[i - 1] : null;
+      const needsSpace = prev && (it.x - (prev.x + prev.width) > 2.0) && !it.text.startsWith(' ') && !prev.text.endsWith(' ');
+
+      if (needsSpace) {
+        runs.push({ text: ' ', bold: false, italic: false, fontSize: it.fontSize });
+      }
+
+      runs.push({
+        text: it.text,
+        bold: it.isBold,
+        italic: it.isItalic,
+        fontSize: it.fontSize
+      });
+
+      // Agrupación de celdas para detección de tablas
       if (!currentCell) {
         currentCell = {
           startX: it.x,
@@ -467,12 +587,12 @@ function processPageTextContent(textContent, pageNumber, pageWidth = 612, pageHe
           text: it.text,
           maxFontSize: it.fontSize,
           hasBold: it.isBold,
-          hasItalic: it.isItalic
+          hasItalic: it.isItalic,
+          runs: [{ text: it.text, bold: it.isBold, italic: it.isItalic, fontSize: it.fontSize }]
         };
       } else {
         const gap = it.x - currentCell.endX;
         if (gap > COLUMN_GAP_THRESHOLD) {
-          // Es una columna distinta en la misma línea
           cells.push(currentCell);
           currentCell = {
             startX: it.x,
@@ -480,18 +600,17 @@ function processPageTextContent(textContent, pageNumber, pageWidth = 612, pageHe
             text: it.text,
             maxFontSize: it.fontSize,
             hasBold: it.isBold,
-            hasItalic: it.isItalic
+            hasItalic: it.isItalic,
+            runs: [{ text: it.text, bold: it.isBold, italic: it.isItalic, fontSize: it.fontSize }]
           };
         } else {
-          // Misma columna / palabra continua
-          if (gap > 2.5 && !it.text.startsWith(' ') && !currentCell.text.endsWith(' ')) {
-            currentCell.text += ' ';
-          }
+          if (needsSpace) currentCell.text += ' ';
           currentCell.text += it.text;
           currentCell.endX = Math.max(currentCell.endX, it.x + it.width);
           if (it.fontSize > currentCell.maxFontSize) currentCell.maxFontSize = it.fontSize;
           if (it.isBold) currentCell.hasBold = true;
           if (it.isItalic) currentCell.hasItalic = true;
+          currentCell.runs.push({ text: (needsSpace ? ' ' : '') + it.text, bold: it.isBold, italic: it.isItalic, fontSize: it.fontSize });
         }
       }
     }
@@ -501,29 +620,26 @@ function processPageTextContent(textContent, pageNumber, pageWidth = 612, pageHe
       const minX = cells[0].startX;
       const maxX = cells[cells.length - 1].endX;
       const totalWidth = maxX - minX;
-      const fullText = cells.map(c => c.text).join('   ');
-      const maxLineFontSize = Math.max(...cells.map(c => c.maxFontSize));
-      const lineBold = cells.some(c => c.hasBold);
-      const lineItalic = cells.some(c => c.hasItalic);
-
-      // Detección de encabezados
-      let isHeading = false;
-      let headingLevel = 0;
-      if (maxLineFontSize >= avgFontSize * 1.55 || (maxLineFontSize >= 16 && lineBold)) {
-        isHeading = true;
-        headingLevel = 1;
-      } else if (maxLineFontSize >= avgFontSize * 1.25 || (maxLineFontSize >= 13 && lineBold)) {
-        isHeading = true;
-        headingLevel = 2;
-      }
+      const fullText = runs.map(r => r.text).join('').trim();
+      const maxLineFontSize = Math.max(...runs.map(r => r.fontSize));
+      const lineBold = runs.every(r => r.bold || r.text.trim() === '');
 
       // Detección de alineación
       let alignment = 'left';
       const centerPos = (minX + maxX) / 2;
       if (Math.abs(centerPos - pageWidth / 2) < 45 && totalWidth < pageWidth * 0.72) {
         alignment = 'center';
-      } else if (minX > pageWidth * 0.48 && maxX > pageWidth - 100) {
+      } else if (minX > pageWidth * 0.48 && maxX > pageWidth - 90) {
         alignment = 'right';
+      }
+
+      // Detección de títulos y encabezados
+      let isHeading = false;
+      let headingLevel = 0;
+      const isAllUpper = fullText.length > 5 && fullText === fullText.toUpperCase() && /[A-ZÁÉÍÓÚ]/.test(fullText);
+      if (maxLineFontSize >= avgFontSize * 1.25 && (alignment === 'center' || lineBold || isAllUpper)) {
+        isHeading = true;
+        headingLevel = maxLineFontSize >= avgFontSize * 1.45 ? 1 : 2;
       }
 
       processedLines.push({
@@ -531,10 +647,10 @@ function processPageTextContent(textContent, pageNumber, pageWidth = 612, pageHe
         minX: minX,
         maxX: maxX,
         cells: cells,
+        runs: runs,
         fullText: fullText,
         fontSize: Math.round(maxLineFontSize),
         isBold: lineBold,
-        isItalic: lineItalic,
         isHeading: isHeading,
         headingLevel: headingLevel,
         alignment: alignment,
@@ -543,35 +659,117 @@ function processPageTextContent(textContent, pageNumber, pageWidth = 612, pageHe
     }
   }
 
-  // Agrupar en Bloques: Tablas (si 2+ líneas consecutivas son multi-columna) o Párrafos
+  // Agrupación inteligente de líneas en bloques de Word
   const blocks = [];
   let currentTableRows = [];
+  let currentFlowingBlock = null;
+
+  // Regex ampliado para viñetas: •, ¢, -, *, \uf0b7, â\x80¢, â € ¢, números 1., letras a)
+  const BULLET_REGEX = /^([•\-\*\u2022\u25cf\uf0b7\u2013\u2014\u00A2¢]|[\u00e2â]\s*[\u0080\u20ac€]\s*[\u00a2¢\u2022•]|\d+[\.\)]|[a-zA-Z][\.\)])\s*/;
 
   for (let i = 0; i < processedLines.length; i++) {
     const line = processedLines[i];
 
     if (line.isMultiColumn) {
+      if (currentFlowingBlock) {
+        blocks.push(currentFlowingBlock);
+        currentFlowingBlock = null;
+      }
       currentTableRows.push(line);
+      continue;
     } else {
       if (currentTableRows.length > 0) {
-        blocks.push({
-          type: 'table',
-          rows: currentTableRows
-        });
+        blocks.push({ type: 'table', rows: currentTableRows });
         currentTableRows = [];
       }
-      blocks.push({
-        type: 'paragraph',
-        line: line
-      });
     }
+
+    // Encabezados / Títulos
+    if (line.isHeading) {
+      if (currentFlowingBlock) {
+        blocks.push(currentFlowingBlock);
+        currentFlowingBlock = null;
+      }
+      blocks.push({
+        type: 'heading',
+        headingLevel: line.headingLevel,
+        alignment: line.alignment,
+        runs: line.runs,
+        fontSize: line.fontSize
+      });
+      continue;
+    }
+
+    // Viñetas / Listas con bullets
+    const bulletMatch = line.fullText.match(BULLET_REGEX);
+    if (bulletMatch) {
+      if (currentFlowingBlock) {
+        blocks.push(currentFlowingBlock);
+        currentFlowingBlock = null;
+      }
+
+      let toRemoveLen = bulletMatch[0].length;
+      const bulletRuns = line.runs.map(r => ({ ...r }));
+      for (let r = 0; r < bulletRuns.length && toRemoveLen > 0; r++) {
+        if (bulletRuns[r].text.length <= toRemoveLen) {
+          toRemoveLen -= bulletRuns[r].text.length;
+          bulletRuns[r].text = '';
+        } else {
+          bulletRuns[r].text = bulletRuns[r].text.substring(toRemoveLen);
+          toRemoveLen = 0;
+        }
+      }
+      const cleanBulletRuns = bulletRuns.filter(r => r.text.length > 0);
+
+      currentFlowingBlock = {
+        type: 'bullet',
+        runs: cleanBulletRuns,
+        lastY: line.y,
+        fontSize: line.fontSize,
+        minX: line.minX
+      };
+      continue;
+    }
+
+    // Párrafos continuos y sangrías
+    if (currentFlowingBlock) {
+      const verticalGap = currentFlowingBlock.lastY - line.y;
+      const normalLineHeight = line.fontSize * 1.55;
+
+      // Si la línea actual es la continuación natural
+      const isContinuation = verticalGap <= normalLineHeight * 1.65 && line.alignment === 'left';
+
+      if (isContinuation) {
+        currentFlowingBlock.runs.push({ text: ' ', bold: false, italic: false, fontSize: line.fontSize });
+        for (const r of line.runs) {
+          currentFlowingBlock.runs.push(r);
+        }
+        currentFlowingBlock.lastY = line.y;
+        currentFlowingBlock.isMultiLine = true;
+        continue;
+      } else {
+        blocks.push(currentFlowingBlock);
+        currentFlowingBlock = null;
+      }
+    }
+
+    // Nuevo párrafo
+    currentFlowingBlock = {
+      type: 'paragraph',
+      alignment: line.alignment,
+      runs: line.runs.map(r => ({ ...r })),
+      lastY: line.y,
+      fontSize: line.fontSize,
+      minX: line.minX,
+      isMultiLine: false
+    };
   }
 
+  if (currentFlowingBlock) {
+    blocks.push(currentFlowingBlock);
+  }
   if (currentTableRows.length > 0) {
-    blocks.push({
-      type: 'table',
-      rows: currentTableRows
-    });
+    blocks.push({ type: 'table', rows: currentTableRows });
   }
 
   const rawText = processedLines.map(l => l.fullText).join('\n');
@@ -604,13 +802,14 @@ async function buildDocxFromExtracted(item) {
     TableCell,
     WidthType,
     BorderStyle,
-    AlignmentType
+    AlignmentType,
+    ImageRun
   } = docx;
 
   const docChildren = [];
   const shouldPreserveLayout = DOM.optPreserveLayout ? DOM.optPreserveLayout.checked : true;
 
-  // Si el usuario editó el texto manualmente en el modal editor
+  // Si el usuario editó el texto manualmente en el editor del modal
   if (item.editedText !== null) {
     const paragraphs = item.editedText.split(/\n\s*\n/);
     for (let i = 0; i < paragraphs.length; i++) {
@@ -637,7 +836,7 @@ async function buildDocxFromExtracted(item) {
       }
     }
   } else {
-    // Usar la extracción estructurada con fidelidad espacial
+    // Usar la extracción estructurada con alta fidelidad institucional
     for (let pIdx = 0; pIdx < item.extractedPages.length; pIdx++) {
       const page = item.extractedPages[pIdx];
 
@@ -649,6 +848,29 @@ async function buildDocxFromExtracted(item) {
         }));
       }
 
+      // 1. Insertar logotipos o membretes de la página (ej. Escudo UNAM al inicio)
+      if (page.images && page.images.length > 0 && shouldPreserveLayout) {
+        for (const img of page.images) {
+          try {
+            docChildren.push(new Paragraph({
+              alignment: AlignmentType.CENTER,
+              children: [
+                new ImageRun({
+                  data: img.data,
+                  transformation: {
+                    width: img.width,
+                    height: img.height
+                  }
+                })
+              ],
+              spacing: { before: 100, after: 180 }
+            }));
+          } catch (imgRunErr) {
+            console.warn('No se pudo insertar ImageRun:', imgRunErr);
+          }
+        }
+      }
+
       if (!page.blocks || page.blocks.length === 0) {
         docChildren.push(new Paragraph({
           children: [new TextRun({ text: '', font: 'Calibri', size: 24 })]
@@ -657,37 +879,63 @@ async function buildDocxFromExtracted(item) {
       }
 
       for (const block of page.blocks) {
-        if (block.type === 'table' && shouldPreserveLayout) {
-          // --- GENERAR TABLA DE WORD REAL ---
+        if (block.type === 'heading') {
+          // --- TÍTULOS Y ENCABEZADOS CENTRADOS/DESTACADOS ---
+          docChildren.push(new Paragraph({
+            heading: block.headingLevel === 1 ? HeadingLevel.HEADING_1 : HeadingLevel.HEADING_2,
+            alignment: block.alignment === 'center' ? AlignmentType.CENTER : AlignmentType.LEFT,
+            children: block.runs.map(r => new TextRun({
+              text: r.text,
+              font: 'Calibri',
+              size: block.headingLevel === 1 ? 28 : 26,
+              bold: true
+            })),
+            spacing: { before: 240, after: 180 }
+          }));
+
+        } else if (block.type === 'bullet' && shouldPreserveLayout) {
+          // --- VIÑETAS CON SANGRÍA COLGANTE PROFESIONAL ---
+          docChildren.push(new Paragraph({
+            alignment: AlignmentType.BOTH,
+            indent: { left: 720, hanging: 360 }, // Sangría colgante estándar de Word
+            children: [
+              new TextRun({ text: '•  ', font: 'Calibri', size: 24 }),
+              ...block.runs.map(r => new TextRun({
+                text: r.text,
+                font: 'Calibri',
+                size: 24, // 12pt
+                bold: r.bold,
+                italics: r.italic
+              }))
+            ],
+            spacing: { before: 40, after: 120, line: 264 }
+          }));
+
+        } else if (block.type === 'table' && shouldPreserveLayout) {
+          // --- TABLAS DE WORD CON CELDAS Y COLUMNAS NATIVAS ---
           const rows = block.rows;
-          // Calcular el número máximo de columnas en este bloque
           const maxCols = Math.max(...rows.map(r => r.cells.length));
-          const printableWidthDxa = 9360; // Ancho imprimible estándar para margen de 1 pulgada
+          const printableWidthDxa = 9360;
           const colWidthDxa = Math.round(printableWidthDxa / maxCols);
 
           const tableRows = rows.map(r => {
             const tableCells = [];
             for (let cIdx = 0; cIdx < maxCols; cIdx++) {
               const cellData = r.cells[cIdx];
-              const cellText = cellData ? cellData.text : '';
-              const isCellBold = cellData ? cellData.hasBold : false;
-              const isCellItalic = cellData ? cellData.hasItalic : false;
-              const cellFontSize = cellData && cellData.maxFontSize ? Math.min(26, Math.max(18, Math.round(cellData.maxFontSize * 1.8))) : 22;
+              const cellRuns = cellData && cellData.runs ? cellData.runs : [{ text: cellData ? cellData.text : '', bold: false, italic: false, fontSize: 11 }];
 
               tableCells.push(new TableCell({
                 width: { size: colWidthDxa, type: WidthType.DXA },
                 margins: { top: 100, bottom: 100, left: 140, right: 140 },
                 children: [
                   new Paragraph({
-                    children: [
-                      new TextRun({
-                        text: cellText,
-                        font: 'Calibri',
-                        size: cellFontSize,
-                        bold: isCellBold,
-                        italics: isCellItalic
-                      })
-                    ],
+                    children: cellRuns.map(r => new TextRun({
+                      text: r.text,
+                      font: 'Calibri',
+                      size: 22,
+                      bold: r.bold,
+                      italics: r.italic
+                    })),
                     spacing: { after: 60 }
                   })
                 ]
@@ -696,7 +944,6 @@ async function buildDocxFromExtracted(item) {
             return new TableRow({ children: tableCells });
           });
 
-          // Si es una tabla grande (3+ filas), bordes suaves; si son encabezados/columnas, bordes invisibles
           const isDataTable = rows.length >= 3;
           const borderStyle = isDataTable
             ? { style: BorderStyle.SINGLE, size: 1, color: 'CBD5E1' }
@@ -715,50 +962,41 @@ async function buildDocxFromExtracted(item) {
             }
           }));
 
-          // Espacio después de la tabla
           docChildren.push(new Paragraph({
             children: [new TextRun({ text: '' })],
             spacing: { after: 140 }
           }));
 
         } else {
-          // --- GENERAR PÁRRAFO CON ALINEACIÓN Y SANGRÍA EXACTAS ---
-          const line = block.line || (block.rows && block.rows[0]);
-          if (!line) continue;
-
+          // --- PÁRRAFOS CONTINUOS CON NEGRITAS INLINE Y TEXTO JUSTIFICADO ---
           let alignment = AlignmentType.LEFT;
-          if (line.alignment === 'center') alignment = AlignmentType.CENTER;
-          else if (line.alignment === 'right') alignment = AlignmentType.RIGHT;
-
-          // Sangría izquierda (indent) si está desplazado del margen izquierdo
-          let indent = undefined;
-          if (shouldPreserveLayout && alignment === AlignmentType.LEFT && line.minX > 75) {
-            indent = { left: Math.min(2800, Math.round((line.minX - 54) * 20)) };
+          if (block.alignment === 'center') {
+            alignment = AlignmentType.CENTER;
+          } else if (block.alignment === 'right') {
+            alignment = AlignmentType.RIGHT;
+          } else if (block.isMultiLine) {
+            // Párrafos de 2 o más líneas en documentos institucionales van justificados
+            alignment = AlignmentType.BOTH;
           }
 
-          let heading = undefined;
-          let fontSizeDxa = 24; // 12pt por defecto
-          if (line.isHeading) {
-            heading = line.headingLevel === 1 ? HeadingLevel.HEADING_1 : HeadingLevel.HEADING_2;
-            fontSizeDxa = line.headingLevel === 1 ? 32 : 28;
+          let indent = undefined;
+          if (shouldPreserveLayout && alignment === AlignmentType.LEFT && block.minX > 75) {
+            indent = { left: Math.min(2800, Math.round((block.minX - 54) * 20)) };
           }
 
           docChildren.push(new Paragraph({
-            heading: heading,
             alignment: alignment,
             indent: indent,
-            children: [
-              new TextRun({
-                text: line.fullText,
-                font: 'Calibri',
-                size: fontSizeDxa,
-                bold: line.isBold,
-                italics: line.isItalic
-              })
-            ],
+            children: block.runs.map(r => new TextRun({
+              text: r.text,
+              font: 'Calibri',
+              size: 24, // 12pt estándar
+              bold: r.bold,
+              italics: r.italic
+            })),
             spacing: {
-              before: line.isHeading ? 220 : 60,
-              after: line.isHeading ? 120 : 160,
+              before: 60,
+              after: 160,
               line: 276
             }
           }));
@@ -767,7 +1005,7 @@ async function buildDocxFromExtracted(item) {
     }
   }
 
-  // Si no se extrajo texto (ej. PDF escaneado sin OCR activado)
+  // Si no se extrajo texto
   if (docChildren.length === 0) {
     docChildren.push(new Paragraph({
       children: [
@@ -783,9 +1021,9 @@ async function buildDocxFromExtracted(item) {
 
   // Crear la estructura de secciones del documento DOCX
   const doc = new Document({
-    creator: 'Convertidor PDF a Word Organizacional',
+    creator: 'Convertidor PDF a Word Institucional',
     title: item.name.replace(/\.pdf$/i, ''),
-    description: 'Documento Word convertido con fidelidad de maquetación y OCR',
+    description: 'Documento Word convertido con fidelidad institucional, texto continuo y logotipos',
     sections: [
       {
         properties: {
