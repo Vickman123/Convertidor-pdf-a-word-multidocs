@@ -14,7 +14,7 @@ if (typeof pdfjsLib !== 'undefined') {
 
 // Estado de la aplicación
 const AppState = {
-  queue: [], // Lista de objetos { id, file, name, sizeFormatted, numPages, status, progress, statusText, pdfDoc, extractedPages, editedText, docxBlob, errorMsg }
+  queue: [], // Lista de objetos { id, file, name, sizeFormatted, numPages, status, progress, statusText, isScanned, tablesCount, pdfDoc, extractedPages, editedText, docxBlob, errorMsg }
   isConverting: false,
   activePreviewId: null,
   currentModalPage: 1,
@@ -44,6 +44,11 @@ const DOM = {
   globalProgressPct: document.getElementById('globalProgressPct'),
   globalProgressBar: document.getElementById('globalProgressBar'),
   toastContainer: document.getElementById('toastContainer'),
+
+  // Configuración Organizacional
+  optPreserveLayout: document.getElementById('optPreserveLayout'),
+  optEnableOcr: document.getElementById('optEnableOcr'),
+  optOcrLang: document.getElementById('optOcrLang'),
 
   // Modal / Editor
   previewModal: document.getElementById('previewModal'),
@@ -266,20 +271,42 @@ async function convertSinglePdf(item) {
 
     const numPages = item.pdfDoc.numPages;
     item.extractedPages = [];
+    item.isScanned = false;
+    let tablesDetectedCount = 0;
 
-    // 2. Extraer capa de texto estructurada página a página
+    // 2. Extraer capa de texto estructurada página a página con detección espacial y OCR
     for (let p = 1; p <= numPages; p++) {
       item.statusText = `Extrayendo pág ${p} de ${numPages}...`;
-      item.progress = Math.min(85, Math.round((p / numPages) * 75) + 5);
+      item.progress = Math.min(85, Math.round((p / numPages) * 70) + 5);
       updateFileCard(item);
 
       const page = await item.pdfDoc.getPage(p);
-      const textContent = await page.getTextContent();
-      const pageData = processPageTextContent(textContent, p);
+      const viewport = page.getViewport({ scale: 1.0 });
+      let textContent = await page.getTextContent();
+
+      // Chequear si la página carece de capa de texto (documento escaneado / imagen)
+      const validChars = (textContent.items || []).map(i => i.str.trim()).join('');
+      if (validChars.length < 20 && DOM.optEnableOcr && DOM.optEnableOcr.checked && typeof Tesseract !== 'undefined') {
+        item.isScanned = true;
+        item.statusText = `Auto-OCR (pág ${p} de ${numPages})...`;
+        updateFileCard(item);
+
+        const ocrResult = await performOcrOnPdfPage(page, p, item, numPages);
+        if (ocrResult && ocrResult.items && ocrResult.items.length > 0) {
+          textContent = ocrResult;
+        }
+      }
+
+      const pageData = processPageTextContent(textContent, p, viewport.width, viewport.height);
+      const tablesInPage = pageData.blocks.filter(b => b.type === 'table').length;
+      tablesDetectedCount += tablesInPage;
+
       item.extractedPages.push(pageData);
     }
 
-    // 3. Generar el documento Microsoft Word (.docx) real
+    item.tablesCount = tablesDetectedCount;
+
+    // 3. Generar el documento Microsoft Word (.docx) con maquetación avanzada
     item.statusText = 'Generando Word (.docx)...';
     item.progress = 90;
     updateFileCard(item);
@@ -303,15 +330,73 @@ async function convertSinglePdf(item) {
 }
 
 /**
- * Analiza los items de texto devueltos por PDF.js:
- * Agrupa por coordenadas Y (líneas) y coordenadas X (palabras),
- * detectando tamaños de fuente para clasificar títulos y párrafos normales.
+ * Ejecuta OCR sobre una página PDF renderizada en Canvas a escala 2.0x
  */
-function processPageTextContent(textContent, pageNumber) {
+async function performOcrOnPdfPage(pdfPage, pageNumber, item, numPages) {
+  if (typeof Tesseract === 'undefined') return null;
+
+  try {
+    const scale = 2.0;
+    const viewport = pdfPage.getViewport({ scale });
+    const canvas = document.createElement('canvas');
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    const ctx = canvas.getContext('2d');
+
+    await pdfPage.render({ canvasContext: ctx, viewport }).promise;
+
+    const lang = DOM.optOcrLang ? DOM.optOcrLang.value : 'spa+eng';
+    const result = await Tesseract.recognize(canvas, lang, {
+      logger: m => {
+        if (m.status === 'recognizing text' && typeof m.progress === 'number') {
+          const pct = Math.round(m.progress * 100);
+          item.statusText = `OCR (pág ${pageNumber}/${numPages}): ${pct}%`;
+          updateFileCard(item);
+        }
+      }
+    });
+
+    const ocrItems = [];
+    if (result && result.data && result.data.lines) {
+      for (const line of result.data.lines) {
+        if (!line.text || line.text.trim().length === 0) continue;
+        const x = line.bbox.x0 / scale;
+        const y = (viewport.height - line.bbox.y1) / scale; // Convertir origen a inferior izquierdo PDF
+        const width = (line.bbox.x1 - line.bbox.x0) / scale;
+        const height = (line.bbox.y1 - line.bbox.y0) / scale;
+        const fontSize = Math.max(10, Math.round(height * 0.85));
+
+        ocrItems.push({
+          str: line.text.trim(),
+          dir: 'ltr',
+          width: width,
+          height: height,
+          transform: [fontSize, 0, 0, fontSize, x, y],
+          fontName: 'Helvetica'
+        });
+      }
+    }
+
+    return { items: ocrItems };
+  } catch (ocrErr) {
+    console.warn(`Error en OCR pág ${pageNumber}:`, ocrErr);
+    return null;
+  }
+}
+
+/**
+ * Analiza los items de texto devueltos por PDF.js o Tesseract OCR:
+ * Agrupa por coordenadas Y (líneas), detecta columnas horizontales separadas (X),
+ * agrupa líneas paralelas en Tablas y detecta alineaciones (centrado, derecha, sangrías).
+ */
+function processPageTextContent(textContent, pageNumber, pageWidth = 612, pageHeight = 792) {
   const items = textContent.items;
   if (!items || items.length === 0) {
     return {
       pageNumber,
+      pageWidth,
+      pageHeight,
+      blocks: [],
       lines: [],
       rawText: ''
     };
@@ -320,12 +405,12 @@ function processPageTextContent(textContent, pageNumber) {
   // Filtrar elementos vacíos
   const validItems = items.filter(it => it.str && it.str.trim().length > 0);
   if (validItems.length === 0) {
-    return { pageNumber, lines: [], rawText: '' };
+    return { pageNumber, pageWidth, pageHeight, blocks: [], lines: [], rawText: '' };
   }
 
-  // Agrupar items en la misma línea usando la coordenada Y (transform[5]) con un margen de tolerancia
+  // Agrupar items en la misma línea usando la coordenada Y (transform[5])
   const linesMap = [];
-  const Y_TOLERANCE = 4.0; // Puntos de tolerancia para la misma línea base
+  const Y_TOLERANCE = 4.5; // Puntos de tolerancia para la misma línea base
 
   for (const it of validItems) {
     const x = it.transform[4];
@@ -334,13 +419,12 @@ function processPageTextContent(textContent, pageNumber) {
     const fontName = (it.fontName || '').toLowerCase();
     const isBold = fontName.includes('bold') || fontName.includes('black') || fontName.includes('heavy');
     const isItalic = fontName.includes('italic') || fontName.includes('oblique');
+    const itemWidth = it.width || (it.str.length * fontSize * 0.52);
 
-    // Buscar si ya existe una línea cercana en Y
     let foundLine = linesMap.find(line => Math.abs(line.y - y) <= Y_TOLERANCE);
     if (!foundLine) {
       foundLine = {
         y: y,
-        fontSize: fontSize,
         items: []
       };
       linesMap.push(foundLine);
@@ -349,101 +433,189 @@ function processPageTextContent(textContent, pageNumber) {
     foundLine.items.push({
       text: it.str,
       x: x,
+      width: itemWidth,
       fontSize: fontSize,
       isBold: isBold,
       isItalic: isItalic
     });
   }
 
-  // Ordenar las líneas de arriba hacia abajo (Y descendente en el sistema de coordenadas PDF)
+  // Ordenar las líneas de arriba hacia abajo (Y descendente en PDF)
   linesMap.sort((a, b) => b.y - a.y);
 
-  // Calcular tamaño de fuente promedio de la página para detectar encabezados
+  // Calcular tamaño de fuente promedio de la página
   const allFontSizes = validItems.map(it => Math.abs(it.transform[0]) || 11);
-  const avgFontSize = allFontSizes.reduce((a, b) => a + b, 0) / allFontSizes.length;
+  const avgFontSize = allFontSizes.reduce((a, b) => a + b, 0) / (allFontSizes.length || 1);
 
+  // Umbral horizontal para separar columnas en una misma línea
+  const COLUMN_GAP_THRESHOLD = 32.0;
   const processedLines = [];
-  const rawTextLines = [];
 
   for (const line of linesMap) {
-    // Ordenar items de izquierda a derecha (X ascendente)
+    // Ordenar de izquierda a derecha
     line.items.sort((a, b) => a.x - b.x);
 
-    // Concatenar texto respetando espacios
-    let lineString = '';
-    let maxFontSize = 0;
-    let hasBold = false;
-    let hasItalic = false;
+    const cells = [];
+    let currentCell = null;
 
     for (let i = 0; i < line.items.length; i++) {
       const it = line.items[i];
-      if (it.fontSize > maxFontSize) maxFontSize = it.fontSize;
-      if (it.isBold) hasBold = true;
-      if (it.isItalic) hasItalic = true;
-
-      if (i > 0) {
-        const prev = line.items[i - 1];
-        // Si hay separación horizontal mayor a 3pt o el texto no tiene espacio al inicio
-        if (it.x - (prev.x + (prev.text.length * 4)) > 2 && !it.text.startsWith(' ')) {
-          lineString += ' ';
+      if (!currentCell) {
+        currentCell = {
+          startX: it.x,
+          endX: it.x + it.width,
+          text: it.text,
+          maxFontSize: it.fontSize,
+          hasBold: it.isBold,
+          hasItalic: it.isItalic
+        };
+      } else {
+        const gap = it.x - currentCell.endX;
+        if (gap > COLUMN_GAP_THRESHOLD) {
+          // Es una columna distinta en la misma línea
+          cells.push(currentCell);
+          currentCell = {
+            startX: it.x,
+            endX: it.x + it.width,
+            text: it.text,
+            maxFontSize: it.fontSize,
+            hasBold: it.isBold,
+            hasItalic: it.isItalic
+          };
+        } else {
+          // Misma columna / palabra continua
+          if (gap > 2.5 && !it.text.startsWith(' ') && !currentCell.text.endsWith(' ')) {
+            currentCell.text += ' ';
+          }
+          currentCell.text += it.text;
+          currentCell.endX = Math.max(currentCell.endX, it.x + it.width);
+          if (it.fontSize > currentCell.maxFontSize) currentCell.maxFontSize = it.fontSize;
+          if (it.isBold) currentCell.hasBold = true;
+          if (it.isItalic) currentCell.hasItalic = true;
         }
       }
-      lineString += it.text;
     }
+    if (currentCell) cells.push(currentCell);
 
-    lineString = lineString.trim();
-    if (lineString.length > 0) {
-      // Detección de títulos / encabezados según el tamaño de fuente relativo
+    if (cells.length > 0) {
+      const minX = cells[0].startX;
+      const maxX = cells[cells.length - 1].endX;
+      const totalWidth = maxX - minX;
+      const fullText = cells.map(c => c.text).join('   ');
+      const maxLineFontSize = Math.max(...cells.map(c => c.maxFontSize));
+      const lineBold = cells.some(c => c.hasBold);
+      const lineItalic = cells.some(c => c.hasItalic);
+
+      // Detección de encabezados
       let isHeading = false;
       let headingLevel = 0;
-
-      if (maxFontSize >= avgFontSize * 1.55 || (maxFontSize >= 16 && hasBold)) {
+      if (maxLineFontSize >= avgFontSize * 1.55 || (maxLineFontSize >= 16 && lineBold)) {
         isHeading = true;
         headingLevel = 1;
-      } else if (maxFontSize >= avgFontSize * 1.25 || (maxFontSize >= 13 && hasBold)) {
+      } else if (maxLineFontSize >= avgFontSize * 1.25 || (maxLineFontSize >= 13 && lineBold)) {
         isHeading = true;
         headingLevel = 2;
       }
 
-      processedLines.push({
-        text: lineString,
-        fontSize: Math.round(maxFontSize),
-        isBold: hasBold,
-        isItalic: hasItalic,
-        isHeading: isHeading,
-        headingLevel: headingLevel
-      });
+      // Detección de alineación
+      let alignment = 'left';
+      const centerPos = (minX + maxX) / 2;
+      if (Math.abs(centerPos - pageWidth / 2) < 45 && totalWidth < pageWidth * 0.72) {
+        alignment = 'center';
+      } else if (minX > pageWidth * 0.48 && maxX > pageWidth - 100) {
+        alignment = 'right';
+      }
 
-      rawTextLines.push(lineString);
+      processedLines.push({
+        y: line.y,
+        minX: minX,
+        maxX: maxX,
+        cells: cells,
+        fullText: fullText,
+        fontSize: Math.round(maxLineFontSize),
+        isBold: lineBold,
+        isItalic: lineItalic,
+        isHeading: isHeading,
+        headingLevel: headingLevel,
+        alignment: alignment,
+        isMultiColumn: cells.length > 1
+      });
     }
   }
 
+  // Agrupar en Bloques: Tablas (si 2+ líneas consecutivas son multi-columna) o Párrafos
+  const blocks = [];
+  let currentTableRows = [];
+
+  for (let i = 0; i < processedLines.length; i++) {
+    const line = processedLines[i];
+
+    if (line.isMultiColumn) {
+      currentTableRows.push(line);
+    } else {
+      if (currentTableRows.length > 0) {
+        blocks.push({
+          type: 'table',
+          rows: currentTableRows
+        });
+        currentTableRows = [];
+      }
+      blocks.push({
+        type: 'paragraph',
+        line: line
+      });
+    }
+  }
+
+  if (currentTableRows.length > 0) {
+    blocks.push({
+      type: 'table',
+      rows: currentTableRows
+    });
+  }
+
+  const rawText = processedLines.map(l => l.fullText).join('\n');
+
   return {
     pageNumber,
+    pageWidth,
+    pageHeight,
+    blocks,
     lines: processedLines,
-    rawText: rawTextLines.join('\n')
+    rawText
   };
 }
 
 /**
- * Construye un documento DOCX nativo usando la librería docx.js
+ * Construye un documento DOCX nativo usando la librería docx.js con maquetación avanzada
  */
 async function buildDocxFromExtracted(item) {
   if (typeof docx === 'undefined') {
     throw new Error('La librería docx.js no está disponible en este momento.');
   }
 
-  const { Document, Paragraph, TextRun, HeadingLevel } = docx;
+  const {
+    Document,
+    Paragraph,
+    TextRun,
+    HeadingLevel,
+    Table,
+    TableRow,
+    TableCell,
+    WidthType,
+    BorderStyle,
+    AlignmentType
+  } = docx;
 
   const docChildren = [];
+  const shouldPreserveLayout = DOM.optPreserveLayout ? DOM.optPreserveLayout.checked : true;
 
-  // Si el usuario editó el texto en el modal, usar el texto personalizado
+  // Si el usuario editó el texto manualmente en el modal editor
   if (item.editedText !== null) {
-    const paragraphs = item.editedText.split(/\n\s*\n/); // Dividir por líneas vacías
+    const paragraphs = item.editedText.split(/\n\s*\n/);
     for (let i = 0; i < paragraphs.length; i++) {
       const pText = paragraphs[i].trim();
       if (pText.length > 0) {
-        // Chequear si es un salto de página manual marcado como [PÁGINA X]
         if (pText.startsWith('--- [PÁGINA') && i > 0) {
           docChildren.push(new Paragraph({
             children: [new TextRun({ text: '' })],
@@ -457,19 +629,19 @@ async function buildDocxFromExtracted(item) {
             new TextRun({
               text: pText,
               font: 'Calibri',
-              size: 24 // 12pt (docx usa medios puntos: 24 = 12pt)
+              size: 24 // 12pt
             })
           ],
-          spacing: { after: 200, line: 276 }
+          spacing: { after: 180, line: 276 }
         }));
       }
     }
   } else {
-    // Usar la extracción estructurada por páginas
+    // Usar la extracción estructurada con fidelidad espacial
     for (let pIdx = 0; pIdx < item.extractedPages.length; pIdx++) {
       const page = item.extractedPages[pIdx];
 
-      // Salto de página entre hojas del documento original
+      // Salto de página entre hojas
       if (pIdx > 0) {
         docChildren.push(new Paragraph({
           children: [new TextRun({ text: '' })],
@@ -477,80 +649,130 @@ async function buildDocxFromExtracted(item) {
         }));
       }
 
-      if (page.lines.length === 0) {
+      if (!page.blocks || page.blocks.length === 0) {
         docChildren.push(new Paragraph({
           children: [new TextRun({ text: '', font: 'Calibri', size: 24 })]
         }));
         continue;
       }
 
-      // Agrupar líneas en párrafos continuos
-      let currentParagraphRuns = [];
-      let isCurrentHeading = false;
-      let currentHeadingLvl = 0;
+      for (const block of page.blocks) {
+        if (block.type === 'table' && shouldPreserveLayout) {
+          // --- GENERAR TABLA DE WORD REAL ---
+          const rows = block.rows;
+          // Calcular el número máximo de columnas en este bloque
+          const maxCols = Math.max(...rows.map(r => r.cells.length));
+          const printableWidthDxa = 9360; // Ancho imprimible estándar para margen de 1 pulgada
+          const colWidthDxa = Math.round(printableWidthDxa / maxCols);
 
-      for (let lIdx = 0; lIdx < page.lines.length; lIdx++) {
-        const line = page.lines[lIdx];
+          const tableRows = rows.map(r => {
+            const tableCells = [];
+            for (let cIdx = 0; cIdx < maxCols; cIdx++) {
+              const cellData = r.cells[cIdx];
+              const cellText = cellData ? cellData.text : '';
+              const isCellBold = cellData ? cellData.hasBold : false;
+              const isCellItalic = cellData ? cellData.hasItalic : false;
+              const cellFontSize = cellData && cellData.maxFontSize ? Math.min(26, Math.max(18, Math.round(cellData.maxFontSize * 1.8))) : 22;
 
-        if (line.isHeading) {
-          // Si había un párrafo acumulándose, vaciarlo
-          if (currentParagraphRuns.length > 0) {
-            docChildren.push(new Paragraph({
-              children: currentParagraphRuns,
-              spacing: { after: 160, line: 276 }
-            }));
-            currentParagraphRuns = [];
+              tableCells.push(new TableCell({
+                width: { size: colWidthDxa, type: WidthType.DXA },
+                margins: { top: 100, bottom: 100, left: 140, right: 140 },
+                children: [
+                  new Paragraph({
+                    children: [
+                      new TextRun({
+                        text: cellText,
+                        font: 'Calibri',
+                        size: cellFontSize,
+                        bold: isCellBold,
+                        italics: isCellItalic
+                      })
+                    ],
+                    spacing: { after: 60 }
+                  })
+                ]
+              }));
+            }
+            return new TableRow({ children: tableCells });
+          });
+
+          // Si es una tabla grande (3+ filas), bordes suaves; si son encabezados/columnas, bordes invisibles
+          const isDataTable = rows.length >= 3;
+          const borderStyle = isDataTable
+            ? { style: BorderStyle.SINGLE, size: 1, color: 'CBD5E1' }
+            : { style: BorderStyle.NONE };
+
+          docChildren.push(new Table({
+            width: { size: printableWidthDxa, type: WidthType.DXA },
+            rows: tableRows,
+            borders: {
+              top: borderStyle,
+              bottom: borderStyle,
+              left: borderStyle,
+              right: borderStyle,
+              insideHorizontal: borderStyle,
+              insideVertical: borderStyle
+            }
+          }));
+
+          // Espacio después de la tabla
+          docChildren.push(new Paragraph({
+            children: [new TextRun({ text: '' })],
+            spacing: { after: 140 }
+          }));
+
+        } else {
+          // --- GENERAR PÁRRAFO CON ALINEACIÓN Y SANGRÍA EXACTAS ---
+          const line = block.line || (block.rows && block.rows[0]);
+          if (!line) continue;
+
+          let alignment = AlignmentType.LEFT;
+          if (line.alignment === 'center') alignment = AlignmentType.CENTER;
+          else if (line.alignment === 'right') alignment = AlignmentType.RIGHT;
+
+          // Sangría izquierda (indent) si está desplazado del margen izquierdo
+          let indent = undefined;
+          if (shouldPreserveLayout && alignment === AlignmentType.LEFT && line.minX > 75) {
+            indent = { left: Math.min(2800, Math.round((line.minX - 54) * 20)) };
           }
 
-          // Crear párrafo de encabezado
+          let heading = undefined;
+          let fontSizeDxa = 24; // 12pt por defecto
+          if (line.isHeading) {
+            heading = line.headingLevel === 1 ? HeadingLevel.HEADING_1 : HeadingLevel.HEADING_2;
+            fontSizeDxa = line.headingLevel === 1 ? 32 : 28;
+          }
+
           docChildren.push(new Paragraph({
-            heading: line.headingLevel === 1 ? HeadingLevel.HEADING_1 : HeadingLevel.HEADING_2,
+            heading: heading,
+            alignment: alignment,
+            indent: indent,
             children: [
               new TextRun({
-                text: line.text,
+                text: line.fullText,
                 font: 'Calibri',
-                bold: true,
-                size: line.headingLevel === 1 ? 32 : 28
+                size: fontSizeDxa,
+                bold: line.isBold,
+                italics: line.isItalic
               })
             ],
-            spacing: { before: 240, after: 120 }
+            spacing: {
+              before: line.isHeading ? 220 : 60,
+              after: line.isHeading ? 120 : 160,
+              line: 276
+            }
           }));
-        } else {
-          // Línea de texto normal
-          currentParagraphRuns.push(new TextRun({
-            text: (currentParagraphRuns.length > 0 ? ' ' : '') + line.text,
-            font: 'Calibri',
-            bold: line.isBold,
-            italics: line.isItalic,
-            size: 24 // 12pt
-          }));
-
-          // Si la línea termina con punto final o dos puntos, cerrar el párrafo para un formato limpio
-          if (line.text.endsWith('.') || line.text.endsWith(':') || lIdx === page.lines.length - 1) {
-            docChildren.push(new Paragraph({
-              children: currentParagraphRuns,
-              spacing: { after: 180, line: 276 }
-            }));
-            currentParagraphRuns = [];
-          }
         }
-      }
-
-      if (currentParagraphRuns.length > 0) {
-        docChildren.push(new Paragraph({
-          children: currentParagraphRuns,
-          spacing: { after: 180, line: 276 }
-        }));
       }
     }
   }
 
-  // Si no se extrajo texto (ej. PDF escaneado sin OCR)
+  // Si no se extrajo texto (ej. PDF escaneado sin OCR activado)
   if (docChildren.length === 0) {
     docChildren.push(new Paragraph({
       children: [
         new TextRun({
-          text: 'Nota: Este documento PDF parece contener únicamente imágenes escaneadas sin capa de texto seleccionable.',
+          text: 'Nota: Este documento PDF parece contener únicamente imágenes sin capa de texto seleccionable. Activa la opción "Auto-OCR Inteligente" para digitalizarlo.',
           italics: true,
           font: 'Calibri',
           size: 22
@@ -561,9 +783,9 @@ async function buildDocxFromExtracted(item) {
 
   // Crear la estructura de secciones del documento DOCX
   const doc = new Document({
-    creator: 'Convertidor PDF a Word Web',
+    creator: 'Convertidor PDF a Word Organizacional',
     title: item.name.replace(/\.pdf$/i, ''),
-    description: 'Documento Word convertido desde PDF',
+    description: 'Documento Word convertido con fidelidad de maquetación y OCR',
     sections: [
       {
         properties: {
@@ -710,7 +932,14 @@ function updateFileCard(item) {
 
   const pagesSpan = document.getElementById(`pages_${item.id}`);
   if (pagesSpan && item.numPages) {
-    pagesSpan.textContent = `${item.numPages} pág(s)`;
+    let extraTags = '';
+    if (item.isScanned) {
+      extraTags += ` • <span class="badge-tag tag-ocr" title="Procesado con OCR"><i class="fa-solid fa-eye"></i> OCR</span>`;
+    }
+    if (item.tablesCount && item.tablesCount > 0) {
+      extraTags += ` • <span class="badge-tag tag-table" title="Tablas preservadas en Word"><i class="fa-solid fa-table"></i> ${item.tablesCount} tabla(s)</span>`;
+    }
+    pagesSpan.innerHTML = `${item.numPages} pág(s)${extraTags}`;
   }
 
   const badge = document.getElementById(`badge_${item.id}`);

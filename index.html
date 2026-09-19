@@ -17,7 +17,9 @@
   <!-- 1. PDF.js de Mozilla y su worker pre-cargado -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js"></script>
-  <!-- 2. docx.js para generación de archivos Word .docx nativos -->
+  <!-- 2. Tesseract.js v5 para OCR en documentos escaneados e imágenes -->
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+  <!-- 3. docx.js para generación de archivos Word .docx nativos -->
   <script src="https://cdn.jsdelivr.net/npm/docx@8.5.0/build/index.umd.js"></script>
   <!-- 3. JSZip para empaquetado y descarga masiva en .ZIP -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
@@ -55,6 +57,37 @@
 
   <!-- Contenedor Principal -->
   <main class="main-container">
+
+    <!-- Panel de Opciones de Maquetación Organizacional -->
+    <section class="config-panel">
+      <div class="config-header">
+        <div class="config-title">
+          <i class="fa-solid fa-sliders text-primary"></i>
+          <span>Motor de Maquetación y OCR Organizacional</span>
+        </div>
+        <span class="config-status"><i class="fa-solid fa-circle-check text-success"></i> Modo Alta Fidelidad Activo</span>
+      </div>
+      <div class="config-options">
+        <label class="toggle-control" title="Mantiene columnas paralelas, celdas y listas como tablas de Word para que no se desordene el texto">
+          <input type="checkbox" id="optPreserveLayout" checked>
+          <span class="toggle-slider"></span>
+          <span class="toggle-text"><strong>Reconstruir Estructura y Tablas</strong> (Coordenadas X/Y)</span>
+        </label>
+        <label class="toggle-control" title="Si un PDF es una imagen o fotocopia escaneada sin texto, activa el motor OCR Tesseract en el navegador">
+          <input type="checkbox" id="optEnableOcr" checked>
+          <span class="toggle-slider"></span>
+          <span class="toggle-text"><strong>Auto-OCR Inteligente</strong> (Para PDFs escaneados)</span>
+        </label>
+        <div class="select-group">
+          <label for="optOcrLang"><i class="fa-solid fa-language"></i> Idioma OCR:</label>
+          <select id="optOcrLang" class="form-select">
+            <option value="spa+eng" selected>Español + Inglés</option>
+            <option value="spa">Solo Español</option>
+            <option value="eng">Solo Inglés</option>
+          </select>
+        </div>
+      </div>
+    </section>
 
     <!-- Zona de Carga (Drag & Drop) -->
     <section class="upload-section">

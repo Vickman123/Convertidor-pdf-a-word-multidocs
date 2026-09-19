@@ -15,21 +15,28 @@ Una potente aplicación web construida con **HTML5, CSS3 y JavaScript moderno** 
   - Barra de progreso global y control individual por documento.
   - Botón maestro **"Convertir Todos"**.
   - Botón maestro **"Descargar Todos (.ZIP)"** para obtener todos los archivos Word empaquetados en un solo clic.
+- **📐 Motor de Maquetación Organizacional (Fidelidad Espacial)**:
+  - **Detección Automática de Tablas**: Identifica bloques con columnas y los convierte en tablas nativas de Word (`docx.Table`), evitando que el texto se descuadre.
+  - **Alineación y Sangrías**: Conserva textos centrados, firmas a la derecha e indentaciones de párrafos según sus coordenadas exactas en la hoja.
+  - **Jerarquía Tipográfica**: Reconoce encabezados (H1, H2) según el tamaño de fuente y estilo original.
+- **🔍 Auto-OCR Inteligente (Tesseract.js)**:
+  - Detección automática de páginas escaneadas o fotocopias sin capa de texto seleccionable.
+  - Reconocimiento óptico de caracteres en segundo plano en múltiples idiomas (Español / Inglés).
 - **📝 Formato Word (.docx) 100% Editable**:
   - Generación de documentos OpenXML nativos compatibles con **Microsoft Word, Microsoft 365, Google Docs, LibreOffice y WPS Office**.
-  - Reconstrucción de párrafos, encabezados (H1, H2), pesos de fuente (negrita, normal) y saltos de página.
 - **👁️ Visor y Editor Integrado**:
   - Vista previa de las páginas del PDF original renderizadas en Canvas de alta resolución con zoom y navegación.
   - Editor de texto interactivo para revisar o hacer ajustes al contenido antes de generar el Word final.
 - **🔒 Privacidad y Seguridad Total**:
-  - Todo el procesamiento se realiza en la memoria RAM de tu propio navegador. Ningún documento se envía a internet.
+  - Todo el procesamiento se realiza en la memoria RAM de tu propio navegador. Ningún documento confidencial sale de tu equipo.
 
 ---
 
 ## 🛠️ Tecnologías y Librerías Utilizadas
 
 - **[PDF.js](https://mozilla.github.io/pdf.js/)** (Mozilla): Motor para parsear capas de texto y renderizar páginas en canvas.
-- **[docx.js](https://docx.js.org/)**: Generador de archivos `.docx` nativos en JavaScript.
+- **[Tesseract.js v5](https://tesseract.projectnaptha.com/)**: Motor de reconocimiento óptico de caracteres (OCR) ejecutado en WebAssembly/JS.
+- **[docx.js v8.5](https://docx.js.org/)**: Generador de documentos Word nativos (`.docx`), tablas, párrafos, sangrías y estilos.
 - **[JSZip](https://stuk.github.io/jszip/)**: Empaquetador masivo para descarga en archivo `.zip`.
 - **[FileSaver.js](https://github.com/eligrey/FileSaver.js/)**: Manejo confiable de descargas binarias en navegadores.
 - **[FontAwesome](https://fontawesome.com/)**: Iconografía moderna y limpia.
